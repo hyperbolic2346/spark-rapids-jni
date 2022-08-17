@@ -47,3 +47,6 @@ endfunction(ConfigureTest)
 
 ConfigureTest(ROW_CONVERSION
     row_conversion.cpp)
+
+ConfigureTest(CAST_STRING
+    cast_string.cpp)

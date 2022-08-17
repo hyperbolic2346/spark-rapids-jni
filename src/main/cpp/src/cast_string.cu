@@ -1,5 +1,8 @@
+#include "cast_string.hpp"
+
 #include <cub/warp/warp_reduce.cuh>
 #include <cudf/column/column.hpp>
+#include <cudf/detail/utilities/integer_utils.hpp>
 
 using namespace cudf;
 
@@ -13,6 +16,10 @@ void compute_validity(size_type* valid_count, size_type const tid, bool const va
   if (tid == 0) { atomicAdd(valid_count, block_valid_count); }
 }
 */
+
+namespace spark_rapids_jni {
+
+namespace detail {
 
 template<typename T, size_type block_size>
 __global__ void string_to_float_kernel(T* out,
@@ -346,3 +353,90 @@ __global__ void string_to_float_kernel(T* out,
 
   // compute_validity(tid, true);
 }
+
+constexpr bool is_whitespace(char const chr) {
+  switch (chr) {
+    case ' ':
+    case '\r':
+    case '\t':
+    case '\n':
+    return true;
+    default: return false;
+  }
+}
+
+template <typename T>
+__global__ void string_to_integer_kernel(T* out,
+  bitmask_type* validity,
+  size_type* valid_count,
+  const char* const chars,
+  offset_type const* offsets,
+  size_type num_rows)
+{
+  // each thread takes a row and marches it and builds the integer for that row
+  auto const row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row > num_rows) {return;}
+  auto const row_start = offsets[row];
+  auto const len = offsets[row + 1] - row_start;
+  T thread_val = 0;
+  int i = 0;
+  T sign = 1;
+  constexpr bool is_signed = std::is_signed_v<T>;
+
+  // skip leading whitespace
+  while (is_whitespace(chars[i + row_start])) { i++; }
+
+  // check for leading +-
+  if (is_signed) {
+    if (chars[i + row_start] == '+' || chars[i + row_start] == '-') {
+      if (chars[i + row_start] == '-') {
+        sign = -1;
+      }
+      i++;
+    }
+
+    // skip whitespace between +- and number
+    while (is_whitespace(chars[i + row_start])) { i++; }
+  }
+
+  for (int c = i; c<len; ++c) {
+    auto const chr = chars[c + row_start];
+    if (is_whitespace(chr)) {
+      continue;
+    }
+    if (chr > '9' || chr < '0') {
+      // invalid character in string!
+      CUDF_UNREACHABLE("Invalid character in integer conversion");
+    }
+
+    if (c != i) thread_val *=10;
+    thread_val += chr - '0';
+  }
+
+  out[row] = is_signed && sign < 1 ? thread_val * sign : thread_val;
+}
+
+} // namespace detail
+
+std::unique_ptr<cudf::column> string_to_int32(
+  strings_column_view const &string_col, bool ansi_mode, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr)
+{
+  rmm::device_uvector<uint32_t> data(string_col.size(), stream);
+  auto const num_words = bitmask_allocation_size_bytes(string_col.size()) / sizeof(bitmask_type);
+  rmm::device_uvector<bitmask_type> null_mask(num_words, stream);
+
+  int32_t valid_count{0};
+
+  dim3 const blocks(util::div_rounding_up_unsafe(string_col.size(), 256));
+  detail::string_to_integer_kernel<<<blocks, {256,0,0}, 0, stream.value()>>>(
+    data.data(),
+    null_mask.data(),
+    &valid_count,
+    string_col.chars().data<char const>(),
+    string_col.offsets().data<cudf::offset_type>(),
+    string_col.size());
+
+  return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32}, string_col.size(), data.release(), null_mask.release());
+}
+
+} // namespace spark_rapids_jni
