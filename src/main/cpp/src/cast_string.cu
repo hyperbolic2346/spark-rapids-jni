@@ -2,6 +2,7 @@
 
 #include <cub/warp/warp_reduce.cuh>
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
 
 using namespace cudf;
@@ -375,7 +376,7 @@ __global__ void string_to_integer_kernel(T* out,
 {
   // each thread takes a row and marches it and builds the integer for that row
   auto const row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row > num_rows) {return;}
+  if (row >= num_rows) {return;}
   auto const row_start = offsets[row];
   auto const len = offsets[row + 1] - row_start;
   T thread_val = 0;
@@ -428,13 +429,17 @@ std::unique_ptr<cudf::column> string_to_int32(
   int32_t valid_count{0};
 
   dim3 const blocks(util::div_rounding_up_unsafe(string_col.size(), 256));
-  detail::string_to_integer_kernel<<<blocks, {256,0,0}, 0, stream.value()>>>(
+  dim3 const threads{256};
+
+  detail::string_to_integer_kernel<<<blocks, threads, 0, stream.value()>>>(
     data.data(),
     null_mask.data(),
     &valid_count,
     string_col.chars().data<char const>(),
     string_col.offsets().data<cudf::offset_type>(),
     string_col.size());
+
+  cudf::set_null_mask(null_mask.data(), 0, string_col.size(), true);
 
   return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32}, string_col.size(), data.release(), null_mask.release());
 }

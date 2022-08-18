@@ -30,7 +30,8 @@ TEST_F(StringToIntegerTests, Simple)
 {
   using namespace cudf;
 
-  strings_column_view scv{test::strings_column_wrapper{"1", "0", "42"}};
+  auto const strings = test::strings_column_wrapper{"1", "0", "42"};
+  strings_column_view scv{strings};
 
   auto const result = spark_rapids_jni::string_to_int32(scv, false, rmm::cuda_stream_default);
 
