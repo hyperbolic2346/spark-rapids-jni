@@ -1,9 +1,17 @@
 #include "cast_string.hpp"
 
-#include <cub/warp/warp_reduce.cuh>
+#include <rmm/device_scalar.hpp>
+#include <rmm/exec_policy.hpp>
+
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_device_view.cuh>
+#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/null_mask.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
+
+#include <cub/warp/warp_reduce.cuh>
+
+#include <cooperative_groups.h>
 
 using namespace cudf;
 
@@ -369,52 +377,67 @@ constexpr bool is_whitespace(char const chr) {
 template <typename T>
 __global__ void string_to_integer_kernel(T* out,
   bitmask_type* validity,
-  size_type* valid_count,
   const char* const chars,
   offset_type const* offsets,
   size_type num_rows)
 {
+  auto const group = cooperative_groups::this_thread_block();
+  auto const warp = cooperative_groups::tiled_partition<cudf::detail::warp_size>(group);
+
   // each thread takes a row and marches it and builds the integer for that row
   auto const row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= num_rows) {return;}
+  auto const active = cooperative_groups::coalesced_threads();
   auto const row_start = offsets[row];
   auto const len = offsets[row + 1] - row_start;
+  bool valid = len > 0;
   T thread_val = 0;
   int i = 0;
   T sign = 1;
   constexpr bool is_signed = std::is_signed_v<T>;
 
-  // skip leading whitespace
-  while (is_whitespace(chars[i + row_start])) { i++; }
-
-  // check for leading +-
-  if (is_signed) {
-    if (chars[i + row_start] == '+' || chars[i + row_start] == '-') {
-      if (chars[i + row_start] == '-') {
-        sign = -1;
-      }
-      i++;
-    }
-
-    // skip whitespace between +- and number
+  if (valid) {
+    // skip leading whitespace
     while (is_whitespace(chars[i + row_start])) { i++; }
+
+    // check for leading +-
+    if (is_signed) {
+      if (chars[i + row_start] == '+' || chars[i + row_start] == '-') {
+        if (chars[i + row_start] == '-') {
+          sign = -1;
+        }
+        i++;
+      }
+    }
+
+    bool truncating = false;
+    for (int c = i; c<len; ++c) {
+      auto const chr = chars[c + row_start];
+      if (chr == '.') {
+        // a decimal point is fine, we attempt to truncate
+        // the value. Invalid characters AFTER this decimal
+        // point will still invalidate this entry
+        truncating = true;
+      } else {
+        if (chr > '9' || chr < '0') {
+          // invalid character in string!
+          valid = false;
+        }
+      }
+
+      if (!truncating) {
+        if (c != i) thread_val *=10;
+        thread_val += chr - '0';
+      }
+    }
+
+    out[row] = is_signed && sign < 1 ? thread_val * sign : thread_val;
   }
 
-  for (int c = i; c<len; ++c) {
-    auto const chr = chars[c + row_start];
-    if (is_whitespace(chr)) {
-      continue;
-    }
-    if (chr > '9' || chr < '0') {
-      // invalid character in string!
-      CUDF_UNREACHABLE("Invalid character in integer conversion");
-    }
-
-    if (c != i) thread_val *=10;
-    thread_val += chr - '0';
+  auto const validity_int32 = warp.ballot(static_cast<int>(valid));
+  if (warp.thread_rank() == 0) {
+    validity[warp.meta_group_rank() + blockIdx.x * warp.meta_group_size()] = validity_int32;
   }
-
-  out[row] = is_signed && sign < 1 ? thread_val * sign : thread_val;
 }
 
 } // namespace detail
@@ -422,11 +445,9 @@ __global__ void string_to_integer_kernel(T* out,
 std::unique_ptr<cudf::column> string_to_int32(
   strings_column_view const &string_col, bool ansi_mode, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr)
 {
-  rmm::device_uvector<uint32_t> data(string_col.size(), stream);
+  rmm::device_uvector<int32_t> data(string_col.size(), stream);
   auto const num_words = bitmask_allocation_size_bytes(string_col.size()) / sizeof(bitmask_type);
   rmm::device_uvector<bitmask_type> null_mask(num_words, stream);
-
-  int32_t valid_count{0};
 
   dim3 const blocks(util::div_rounding_up_unsafe(string_col.size(), 256));
   dim3 const threads{256};
@@ -434,14 +455,40 @@ std::unique_ptr<cudf::column> string_to_int32(
   detail::string_to_integer_kernel<<<blocks, threads, 0, stream.value()>>>(
     data.data(),
     null_mask.data(),
-    &valid_count,
     string_col.chars().data<char const>(),
     string_col.offsets().data<cudf::offset_type>(),
     string_col.size());
 
-  cudf::set_null_mask(null_mask.data(), 0, string_col.size(), true);
+  auto col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32}, string_col.size(), data.release(), null_mask.release());
 
-  return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32}, string_col.size(), data.release(), null_mask.release());
+  if (ansi_mode) {
+    auto const num_nulls = col->null_count();
+    if (num_nulls > 0) {
+      auto const cdv = column_device_view::create(*col, stream);
+      auto const first_error = thrust::find_if(rmm::exec_policy(stream), thrust::make_counting_iterator(0), thrust::make_counting_iterator(col->size()),
+        [device_col = *cdv] __device__ (auto const i) {
+          return not device_col.is_valid(i);
+        });
+
+      cudf::offset_type string_bounds[2];
+      cudaMemcpyAsync(
+        &string_bounds, &string_col.offsets().data<cudf::offset_type>()[*first_error], sizeof(cudf::offset_type) * 2,
+        cudaMemcpyDeviceToHost, stream.value());
+      stream.synchronize();
+
+      std::string dest;
+      dest.resize(string_bounds[1] - string_bounds[0]);
+      
+      cudaMemcpyAsync(dest.data(), &string_col.chars().data<char const>()[string_bounds[0]], string_bounds[1] - string_bounds[0],
+                      cudaMemcpyDeviceToHost, stream.value());
+      stream.synchronize();
+
+      CUDF_EXPECTS(num_nulls == 0, "String column had " + std::to_string(num_nulls) + " parse errors, first error was line " +
+                   std::to_string(*first_error + 1) + ": '" + dest + "'!");
+    }
+  }
+
+  return col;
 }
 
 } // namespace spark_rapids_jni
